@@ -7,6 +7,8 @@ my $baud-rate     = 115200;
 my $input-fh  = open :bin, $input-device;
 my $output-fh = open :w,   $output-device;
 
+my $autopilot = True;
+
 # TODO review these
 my @stty-opts = <
    line 0 min 0 time 0
@@ -20,13 +22,14 @@ enum Modes <Slow Normal Fast Fun>;
 my $max-value = 32767;
 
 my %scalers = %(
-    Slow   => 1 ÷ 3000,
-    Normal => 1 ÷  200,
-    Fast   => 1 ÷   25,
-    Fun    => 1 ÷    1,
+    Slow   => ( 100,   50),
+    Normal => (2000,  400),
+    Fast   => (3000,  500),
+    Fun    => (9000,  800),
+    Auto   => (8000,  800), # for software control
 );
 
-my $tilt-scaler = 1 % 6;
+my $tilt-scaler = 1 / 1.5;
 
 
 #| Buttons
@@ -34,21 +37,22 @@ multi process($buf where .[6] == 0x01) {
     my $pressed = so $buf[4];
     my $button  =    $buf[7];
     # say ‘button ’, $button, ‘ ’, $pressed;
+
     if !$pressed and 4 ≤ $button ≤ 7 {
         zoom 0;
         return
     }
     given $button {
         when  5 { zoom +2 }
-        when  7 { zoom +4 }
+        when  7 { zoom +5 }
         when  4 { zoom -2 }
-        when  6 { zoom -4 }
+        when  6 { zoom -5 }
 
         when 11 { slow-mode $pressed }
         when 10 { fast-mode $pressed }
         when  9 {  fun-mode $pressed }
 
-        my $value = $pressed ?? $max-value !! 0;
+        my $value = $pressed ?? 1 !! 0;
         when  3 {  pan -1 × $value, :mode(Slow) }
         when  1 {  pan +1 × $value, :mode(Slow) }
         when  0 { tilt -1 × $value, :mode(Slow) }
@@ -60,11 +64,17 @@ multi process($buf where .[6] == 0x01) {
 multi process($buf where .[6] == 0x02) {
     my $axis = $buf[7];
     my int16 $value = ($buf[5] +< 8) + $buf[4];
+    my $normalized = $value ÷ $max-value;
     # say ‘axis ’, $axis, ‘ ’, $value;
     if $axis == 0 {
-        pan  $value
+        $autopilot = False;
+        pan  $normalized
     } elsif $axis == 3 {
-        tilt $value
+        tilt $normalized
+    } elsif $axis == 4 {
+        if $value == -32767 {
+            $autopilot = not $autopilot;
+        }
     }
 }
 
@@ -78,22 +88,24 @@ multi process($buf) { }
 my $current-mode = Normal;
 
 my $tilt-last = 0;
-sub tilt(Int() $value = $tilt-last, :$mode = $current-mode) {
+sub tilt($value = $tilt-last, :$mode = $current-mode) {
     $tilt-last = $value;
-    my $scaled = $value × %scalers{$mode} × $tilt-scaler;
+    my $scaled = $value × %scalers{$mode}[0] × $tilt-scaler;
     $scaled .= Int;
     my $str = “G0 X$scaled”;
+    $str = “M201 X” ~ %scalers{$mode}[1] ~ “\n” ~ $str;
     $output-fh.put: $str;
     put $str;
 }
 
 
 my $pan-last = 0;
-sub pan(Int() $value = $pan-last, :$mode = $current-mode) {
+sub pan($value = $pan-last, :$mode = $current-mode) {
     $pan-last = $value;
-    my $scaled = $value × %scalers{$mode};
+    my $scaled = $value × %scalers{$mode}[0];
     $scaled .= Int;
     my $str = “G0 Z$scaled”;
+    $str = “M201 Z” ~ %scalers{$mode}[1] ~ “\n” ~ $str;
     $output-fh.put: $str;
     put $str;
 }
@@ -142,24 +154,70 @@ sub update-mode {
 }
 
 
+
 run <stty -F>, $output-device, $baud-rate, @stty-opts;
 
 my $in = Channel.new;
 start { $in.send: $_ for $*IN.lines }
+
+my $dead-delay = 2.0;
+my $dead-ticks = 0;
+
+my $iteration-time = 0.1;
+my $error = 0;
+my $error-prior = 0;
+my $integral = 0;
+my $KP = 1;
+my $KI = 0;
+my $KD = 0; # 0.15
+my $bias = 0;
+
+my $cap = 1;
+
+my $window = 3;
+my @last-errors;
 
 react {
     whenever $input-fh.Supply(:8size) {
          .say;
         process $_
     }
+    whenever Supply.interval($dead-delay) {
+        $dead-ticks++;
+        if $dead-ticks ≥ 2 {
+            $error = 0;
+        }
+    }
     whenever $in {
+        $dead-ticks = 0;
         my @words = .words;
         when @words[0] eq ‘Z’ {
-            #say +@words[1];
-            pan +@words[1] * 300
+            my $current-error = +@words[1];
+            @last-errors.unshift: $current-error;
+            @last-errors = @last-errors[^$window] if @last-errors > $window;
+            # note $error;
+            $error = @last-errors.sum / @last-errors;
+            #$error = 0 if $error ~~ -5..+5;
         }
         default {
             .say
+        }
+    }
+    whenever Supply.interval($iteration-time) { # PID
+        # my $error       = $desired-value – $actual-value;
+        $integral       = $integral + ($error * $iteration-time);
+        my $derivative  = ($error - $error-prior) / $iteration-time;
+        my $output      = $KP * $error + $KI * $integral + $KD * $derivative + $bias;
+        $error-prior    = $error;
+
+        #note “error: $error integral: $integral output: $output”;
+        $output min= +$cap;
+        $output max= -$cap;
+        if $autopilot {
+            say $output;
+            pan $output, :mode(‘Auto’)
+        } else {
+            $integral = 0
         }
     }
 }

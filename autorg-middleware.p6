@@ -8,6 +8,8 @@ my $input-fh  = open :bin, $input-device;
 my $output-fh = open :w,   $output-device;
 
 my $autopilot = True;
+my $autopilot-zoom = True;
+my $bypass = False;
 
 # TODO review these
 my @stty-opts = <
@@ -22,11 +24,13 @@ enum Modes <Slow Normal Fast Fun>;
 my $max-value = 32767;
 
 my %scalers = %(
-    Slow   => ( 100,   50),
-    Normal => (2000,  400),
-    Fast   => (3000,  500),
-    Fun    => (9000,  800),
-    Auto   => (8000,  800), # for software control
+    Slow   => (  100,  200),
+    Normal => ( 4000,  200),
+    Fast   => ( 5000,  200),
+    Fun    => (16000,  300),
+#    Auto   => (13000,  600), # for software control
+    Auto   => ( 8000,  100), # for software control
+    Bypass => (13000,  200), # for software control
 );
 
 my $tilt-scaler = 1 / 1.5;
@@ -43,10 +47,10 @@ multi process($buf where .[6] == 0x01) {
         return
     }
     given $button {
-        when  5 { zoom +2 }
-        when  7 { zoom +5 }
-        when  4 { zoom -2 }
-        when  6 { zoom -5 }
+        when  5 { zoom-autopilot-off(); zoom +2 }
+        when  7 { zoom-autopilot-off(); zoom +5 }
+        when  4 { zoom-autopilot-off(); zoom -2 }
+        when  6 { zoom-autopilot-off(); zoom -5 }
 
         when 11 { slow-mode $pressed }
         when 10 { fast-mode $pressed }
@@ -75,6 +79,14 @@ multi process($buf where .[6] == 0x02) {
         if $value == -32767 {
             $autopilot = not $autopilot;
         }
+    } elsif $axis == 5 {
+        if $value == -32767 {
+            if $autopilot-zoom {
+                zoom-autopilot-off
+            } else {
+                $autopilot-zoom = True
+            }
+        }
     }
 }
 
@@ -87,34 +99,49 @@ multi process($buf) { }
 
 my $current-mode = Normal;
 
+my $tilt-acc-last = 0;
 my $tilt-last = 0;
 sub tilt($value = $tilt-last, :$mode = $current-mode) {
     $tilt-last = $value;
     my $scaled = $value × %scalers{$mode}[0] × $tilt-scaler;
     $scaled .= Int;
     my $str = “G0 X$scaled”;
-    $str = “M201 X” ~ %scalers{$mode}[1] ~ “\n” ~ $str;
+    my $acc = %scalers{$mode}[1];
+    if $acc != $tilt-acc-last or (^25).pick == 0 {
+        $tilt-acc-last = $acc;
+        $str = “M201 X” ~ %scalers{$mode}[1] ~ “\n” ~ $str;
+    }
     $output-fh.put: $str;
     put $str;
 }
 
-
+my $pan-acc-last = 0;
 my $pan-last = 0;
 sub pan($value = $pan-last, :$mode = $current-mode) {
     $pan-last = $value;
     my $scaled = $value × %scalers{$mode}[0];
     $scaled .= Int;
     my $str = “G0 Z$scaled”;
-    $str = “M201 Z” ~ %scalers{$mode}[1] ~ “\n” ~ $str;
+    my $acc = %scalers{$mode}[1];
+    if $acc != $pan-acc-last or (^25).pick == 0 {
+        $pan-acc-last = $acc;
+        $str = “M201 Z” ~ %scalers{$mode}[1] ~ “\n” ~ $str;
+    }
     $output-fh.put: $str;
     put $str;
 }
 
 
 my $zoom-visitors = 0;
+sub zoom-autopilot-off() {
+    if $autopilot-zoom {
+        $zoom-visitors = 0;
+        $autopilot-zoom = False;
+    }
+}
 sub zoom(Int() $value) {
     $zoom-visitors += $value ?? +1 !! -1;
-    return if !$value and $zoom-visitors;;
+    return if !$autopilot-zoom and !$value and $zoom-visitors;
     my $str = “G0 Y$value”;
     $output-fh.put: $str;
     put $str;
@@ -160,7 +187,7 @@ run <stty -F>, $output-device, $baud-rate, @stty-opts;
 my $in = Channel.new;
 start { $in.send: $_ for $*IN.lines }
 
-my $dead-delay = 2.0;
+my $dead-delay = 1.0;
 my $dead-ticks = 0;
 
 my $iteration-time = 0.1;
@@ -177,8 +204,10 @@ my $cap = 1;
 my $window = 3;
 my @last-errors;
 
+my $zoom-error = 0;
+
 react {
-    whenever $input-fh.Supply(:8size) {
+    whenever $input-fh.Supply(:8size) { # manual control
          .say;
         process $_
     }
@@ -199,25 +228,47 @@ react {
             $error = @last-errors.sum / @last-errors;
             #$error = 0 if $error ~~ -5..+5;
         }
+        when @words[0] eq ‘Y’ {
+            my $current-error = +@words[1];
+            $zoom-error = $current-error;
+        }
         default {
-            .say
+            note “UNRECOGNIZED INPUT: $_”
         }
     }
-    whenever Supply.interval($iteration-time) { # PID
-        # my $error       = $desired-value – $actual-value;
-        $integral       = $integral + ($error * $iteration-time);
-        my $derivative  = ($error - $error-prior) / $iteration-time;
-        my $output      = $KP * $error + $KI * $integral + $KD * $derivative + $bias;
-        $error-prior    = $error;
+    if $bypass {
+        whenever Supply.interval($iteration-time) {
+            if $autopilot {
+                my $output = $error;
+                $output min= +$cap;
+                $output max= -$cap;
+                say $output;
+                pan $output, :mode(‘Bypass’)
+            }
+        }
+    } else {
+        whenever Supply.interval($iteration-time) { # PID
+            # my $error       = $desired-value – $actual-value;
+            $integral       = $integral + ($error * $iteration-time);
+            my $derivative  = ($error - $error-prior) / $iteration-time;
+            my $output      = $KP * $error + $KI * $integral + $KD * $derivative + $bias;
+            $error-prior    = $error;
 
-        #note “error: $error integral: $integral output: $output”;
-        $output min= +$cap;
-        $output max= -$cap;
-        if $autopilot {
-            say $output;
-            pan $output, :mode(‘Auto’)
-        } else {
-            $integral = 0
+            #note “error: $error integral: $integral output: $output”;
+            $output min= +$cap;
+            $output max= -$cap;
+            if $autopilot {
+                say $output;
+                pan $output, :mode(‘Auto’)
+            } else {
+                $integral = 0
+            }
+        }
+        whenever Supply.interval($iteration-time * 10) {
+            say $autopilot-zoom;
+            if $autopilot-zoom {
+                zoom round($zoom-error × 20)
+            }
         }
     }
 }

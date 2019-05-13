@@ -15,10 +15,10 @@ enum Modes <Slow Normal Fast Fun>;
 my $max-value = 32767;
 
 my %scalers = %(
-    Slow   => (  800,  200),
-    Normal => ( 2000,   50),
-    Fast   => ( 5000,  200),
-    Fun    => (16000,  300),
+    Slow   => (  800,   70),
+    Normal => ( 1000,   70),
+    Fast   => ( 2500,  200),
+    Fun    => (16000,   70),
 );
 
 
@@ -43,10 +43,15 @@ multi process($buf where .[6] == 0x01) {
         when  9 {  fun-mode $pressed }
 
         my $value = $pressed ?? 1 !! 0;
-        when  3 {  pan -1 × $value, :mode(Slow) }
-        when  1 {  pan +1 × $value, :mode(Slow) }
-        when  0 { tilt -1 × $value, :mode(Slow) }
-        when  2 { tilt +1 × $value, :mode(Slow) }
+        when  3 {  pan -1 × $value * 4, :mode(Slow) }
+        when  1 {  pan +1 × $value * 4, :mode(Slow) }
+        when  0 { tilt -1 × $value * 2, :mode(Slow) }
+        when  2 { tilt +1 × $value * 2, :mode(Slow) }
+
+        when 8  {
+            $autopilot = True;
+            $autopilot-zoom = True;
+        }
     }
 }
 
@@ -62,6 +67,21 @@ multi process($buf where .[6] == 0x02) {
     } elsif $axis == 3 {
         tilt $normalized
     } elsif $axis == 4 {
+        if      $value == -32767 {
+            choose-cam 1
+        } elsif $value == +32767 {
+            choose-cam 2
+        }
+    } elsif $axis == 5 {
+        if      $value == -32767 {
+            title-advance -1;
+            title-cancel;
+        } elsif $value == +32767 {
+            title-advance +1;
+            title-show;
+        }
+    }
+    #`｢elsif $axis == 4 {
         if $value == -32767 {
             $autopilot = not $autopilot;
         }
@@ -73,7 +93,7 @@ multi process($buf where .[6] == 0x02) {
                 $autopilot-zoom = True
             }
         }
-    }
+    }｣
 }
 
 #| Don't care
@@ -163,12 +183,33 @@ sub update-mode {
 
 use RoboRG::Middleware;
 
-my $recover-interval = 1;
-my $channel = service-publish ‘manual-controller’, ‘output’, 4242;
+my $recover-interval = 0.5;
+my $channel-control = service-publish ‘manual-controller’,  ‘output’, 4242;
+my $channel-visuals = service-publish ‘visuals-controller2’, ‘output’, 4241;
 
 sub send($msg) {
-    put $msg; # just for the visuals
-    $channel.send: $msg; # send the thing
+    put ‘output’, $msg; # just for for the terminal
+    $channel-control.send: $msg; # send the thing
+}
+sub send-visuals($msg) {
+    put ‘visuals’, $msg; # just for for the terminal
+    my $fh = open('joysticklog', :a);
+    $fh.put("{now} $msg");
+    $fh.close;
+    $channel-visuals.send: $msg; # send the thing
+}
+
+sub choose-cam($cam-id) {
+    send-visuals “cam $cam-id”
+}
+sub title-advance($difference) {
+    send-visuals “title-advance $difference”
+}
+sub title-show() {
+    send-visuals “title-show”
+}
+sub title-cancel() {
+    send-visuals “title-cancel”
 }
 
 react {

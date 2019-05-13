@@ -2,6 +2,8 @@
 
 use RoboRG::Middleware;
 
+unit sub MAIN(:$bypass = False);
+
 my $output-device = ‘/dev/ttyUSB0’;
 my $baud-rate     = 115200;
 
@@ -16,7 +18,7 @@ my @stty-opts = <
 
 run <stty -F>, $output-device, $baud-rate, @stty-opts;
 
-my $debug-interval = 0.01;
+my $debug-interval = 0.1;
 
 my $dead-delay = 1.0;
 my $dead-ticks = 0;
@@ -47,7 +49,7 @@ my $autopilot-zoom = False;
 
 my $debug-channel = service-publish ‘middleware’, ‘debug’, 4200;
 
-my @autopilot-scaler = 10000, 110;
+my @autopilot-scaler = 10000, 10000, 110;
 my $zoom-scaler = 17;
 
 my $acceptable-window = 0.15;
@@ -103,6 +105,8 @@ sub dead-sequence($dead-tick) {
     }
 }
 
+my %bypass-values;
+
 react {
     whenever Supply.interval: $debug-interval {
         $debug-channel.send: join ‘;’,
@@ -119,7 +123,7 @@ react {
             my $value = ?+$cmd.words[1];
             #if !$autopilot-pan and $value {
             if $value {
-                $output-fh.put: “M201 Z” ~ @autopilot-scaler[1];
+                $output-fh.put: “M201 Z” ~ @autopilot-scaler[2];
             }
             $autopilot-pan = $value;
         } elsif $cmd.starts-with: ‘autopilot-zoom’ {
@@ -140,63 +144,79 @@ react {
             dead-sequence($dead-ticks);
         }
     }
-    whenever service-subscribe(‘legacy-software-controller’, ‘output’) {
-        my $message = .body-text;
-        $dead-ticks = 0;
-        my @words = $message.words;
-        when @words[0] eq ‘Z’ {
-            $current-reading = +@words[1];
-            my $i = 0;
-            for @ranges -> ($coefs, $matcher) {
-                if $current-reading ~~ $matcher {
-                    $current-range = $i;
-                    goto(|$coefs);
-                    last;
-                }
-                $i++;
-            }
-            if is-acceptable $current-reading {
-                $acceptable-ticks++;;
-                $current-reading = $desired-value + ($current-reading
-                                                     - $desired-value) / $acceptable-ticks;
-                $integral /= 2;
-                #dd $acceptable-ticks;
-                if $acceptable-ticks > 35 {
-                    $desired-value = 0;
-                }
-            } else {
-                $acceptable-ticks = 0;
-            }
-            @last-errors.unshift: $current-reading;
-            @last-errors = @last-errors[^$window] if @last-errors > $window;
-            # note $error;
-            #$last-reading = @last-errors.sum / @last-errors;
-
-            $last-reading-with-decay = (0.7 * $last-reading-with-decay +
-                                        0.3 * $current-reading);
-            #$KP = $error.abs;
-            #$error = 0 if $error ~~ -5..+5;
-        }
-        when @words[0] eq ‘Y’ {
-            my $current-error = +@words[1];
-            $zoom-error = 0.9 * $zoom-error + 0.1 * $current-error; # exponential decay
-        }
-        default {
-            note “UNRECOGNIZED INPUT: $message”
-        }
-    }
-    #`｢
     if $bypass {
-        whenever Supply.interval($iteration-time) {
-            if $autopilot {
-                my $output = $error;
-                $output min= +$cap;
-                $output max= -$cap;
-                say $output;
-                pan $output, :mode(‘Bypass’)
+        whenever service-subscribe(‘legacy-software-controller’, ‘output’) {
+            my @words = .words;
+            when @words[0] eq ‘X’|‘Y’|‘Z’ {
+                %bypass-values = +@words[1];
             }
         }
-    } else {｣
+        whenever Supply.interval($iteration-time) {
+            if $autopilot-pan {
+                {
+                    my $scaled = round(%bypass-values<X> * @autopilot-scaler[0]);
+                    my $cmd = “G0 X$scaled”;
+                    send $cmd;
+                }
+                {
+                    my $scaled = round(%bypass-values<Z> * @autopilot-scaler[1]);
+                    my $cmd = “G0 Z$scaled”;
+                    send $cmd;
+                }
+            }
+            if $autopilot-zoom {
+                my $scaled = round(%bypass-values<Y> * @autopilot-scaler[2]);
+                my $cmd = “G0 Y$scaled”;
+                send $cmd;
+            }
+        }
+    } else {
+        whenever service-subscribe(‘legacy-software-controller’, ‘output’) {
+            my $message = .body-text;
+            $dead-ticks = 0;
+            my @words = $message.words;
+            when @words[0] eq ‘Z’ {
+                $current-reading = +@words[1];
+                my $i = 0;
+                for @ranges -> ($coefs, $matcher) {
+                    if $current-reading ~~ $matcher {
+                        $current-range = $i;
+                        goto(|$coefs);
+                        last;
+                    }
+                    $i++;
+                }
+                if is-acceptable $current-reading {
+                    $acceptable-ticks++;;
+                    $current-reading = $desired-value + ($current-reading
+                                                         - $desired-value) / $acceptable-ticks;
+                    $integral /= 2;
+                    #dd $acceptable-ticks;
+                    if $acceptable-ticks > 35 {
+                        $desired-value = 0;
+                    }
+                } else {
+                    $acceptable-ticks = 0;
+                }
+                @last-errors.unshift: $current-reading;
+                @last-errors = @last-errors[^$window] if @last-errors > $window;
+                # note $error;
+                #$last-reading = @last-errors.sum / @last-errors;
+
+                $last-reading-with-decay = (0.7 * $last-reading-with-decay +
+                                            0.3 * $current-reading);
+                #$KP = $error.abs;
+                #$error = 0 if $error ~~ -5..+5;
+            }
+            when @words[0] eq ‘Y’ {
+                my $current-error = +@words[1];
+                $zoom-error = 0.9 * $zoom-error + 0.1 * $current-error; # exponential decay
+            }
+            default {
+                note “UNRECOGNIZED INPUT: $message”
+            }
+        }
+
         whenever Supply.interval($iteration-time) { # PID
             #my $error       = $desired-value – $actual-value;
             my $error       = $last-reading-with-decay - $desired-value;
@@ -247,5 +267,5 @@ react {
                 send $cmd;
             }
         }
-    #} #｢｣
+    }
 }

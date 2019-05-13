@@ -1,0 +1,6 @@
+#!/bin/bash
+dev=$1
+
+gst-launch-1.0 -v v4l2src device="$1" ! video/x-raw,width=1920,height=1080,framerate=60/1 ! tee name=t \
+               t. ! queue ! videoscale ! video/x-raw,width=1280,height=720 ! v4l2sink device=/dev/video11 \
+               t. ! queue ! videorate ! "video/x-raw,framerate=15/1" ! videoscale ! video/x-raw,width=480,height=270 ! v4l2sink device=/dev/video12

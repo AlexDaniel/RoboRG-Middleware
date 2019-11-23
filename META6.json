@@ -1,0 +1,19 @@
+{
+    "perl"        : "6.d",
+    "name"        : "RoboRG",
+    "version"     : "1.0.0",
+    "description" : "Middleware for communicating with RoboRG PTZ Head",
+    "authors"     : [
+        "Aleks-Daniel Jakimenko-Aleksejev <alex.jakimenko@gmail.com>"
+    ],
+    "license"     : "AGPL-3.0-or-later",
+    "provides"    : {
+    },
+    "depends"     : [
+        "Cro::WebSocket",
+        "Cro::WebSocket::Client",
+        "Cro::ZeroMQ::Message"
+    ],
+    "resources"   : [ ],
+    "source-url"  : "https://github.com/RGVID-EU/RoboRG-Middleware.git"
+}

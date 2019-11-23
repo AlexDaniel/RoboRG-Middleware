@@ -32,7 +32,7 @@ sub service-announce($service, $port, $description,
     $p.start;
 }
 
-#| Discover a service using mDNS
+#| Discover services using mDNS
 sub service-get($service,
                 :$service-type=‘_roborg._tcp’) is export {
 
@@ -44,7 +44,7 @@ sub service-get($service,
             if @parts > 8 and @parts[0] eq ‘=’
             and @parts[2] eq ‘IPv4’ and @parts[3] eq $service { # TODO ipv6?
                 note “🤖 Found a service $service”;
-                emit @parts[7,8] # address and port
+                emit @parts[6,7,8] # host, address, port
             }
         }
         $p.start;
@@ -70,8 +70,15 @@ sub service-publish($service, $topic, $port, $host=‘0.0.0.0’) is export {
 #| Create a subscriber
 sub service-subscribe($service, $topic) is export {
     supply {
-        whenever service-get($service) -> ($host, $port) {
-            my $connect = “$prefix$host:$port”;
+        my %found-services;
+        whenever service-get($service) -> ($hostname, $ip, $port) {
+            if %found-services{$hostname} {
+                note “🤖 Ignoring $hostname on $ip:$port to avoid a duplicate connection”;
+                next;
+            }
+            %found-services{$hostname} = True;
+
+            my $connect = “$prefix$hostname:$port”;
             note “🤖 Connecting to $connect”;
 
             my $sub = Cro::ZeroMQ::Socket::Sub.new(:$connect, subscribe => $topic);
